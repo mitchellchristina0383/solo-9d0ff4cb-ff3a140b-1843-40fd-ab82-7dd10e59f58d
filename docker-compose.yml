@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: demo
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  api:
+    build: ./app
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: demo
+      PGUSER: app
+      PGPASSWORD: app
+      POOL_SIZE: "4"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
