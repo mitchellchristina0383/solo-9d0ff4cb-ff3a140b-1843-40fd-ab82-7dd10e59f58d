@@ -16,6 +16,10 @@ FastAPI + 自研异步连接池解决这些问题：
 - 会话级只读（`default_transaction_read_only=on`），本 API 只暴露
   固定的 SELECT 查询，不执行任意 SQL。
 
+此外，服务内置 **pg_stat_statements 巡检榜单**（见下文“巡检”一节）：
+值班员在 `/docs` 手动采样，即可得到相邻两次巡检之间按执行耗时增量
+排名的最耗时 SQL，并自动识别单条重置 / 淘汰重现等不可比条目。
+
 ## 快速开始
 
 ```bash
@@ -24,9 +28,14 @@ docker compose up --build
 
 - API 文档（Swagger UI）：http://localhost:8000/docs
 - 连接池指标：http://localhost:8000/pool/stats
+- 巡检接口前缀：`/inspect`（同样在 `/docs` 内可点击）
 - PostgreSQL：`localhost:5432`，用户/密码/库均为 `app`/`app`/`demo`
 
 连接池大小用环境变量 `POOL_SIZE` 控制（默认 4，见 `docker-compose.yml`）。
+数据库镜像为 **PostgreSQL 17**：巡检依赖按条目的 `stats_since`（起算时间）
+与单条重置 `pg_stat_statements_reset(userid, dbid, queryid)`，这两者都是
+PG17 的 pg_stat_statements 才具备的能力；扩展在 `db/init.sql` 中自动创建。
+
 
 ## 接口
 
@@ -58,6 +67,69 @@ docker compose up --build
    `/pool/stats` 的 `waiting`/`in_use` 会立刻回落，
    `counters.queue_cancelled` 或 `client_disconnects` 加一。
 
+## 巡检：两次巡检之间的最耗时 SQL
+
+数据库变慢时，值班员想知道“上一次巡检到现在，哪些 SQL 最耗时”。本服务
+在 `/docs` 下提供一组手动巡检接口（实现见 `app/pg_inspect.py` 与
+`app/pg_inspect_api.py`），数据源是 PostgreSQL 的 `pg_stat_statements`。
+
+### 配对规则
+
+统计条目以四元组 `(userid, dbid, toplevel, queryid)` 标识。一条 SQL 只有
+**同时满足**下面两个条件才进入榜单：
+
+1. 在相邻两份**有效样本**中都出现；
+2. 两份样本里该条目的 `stats_since`（条目起算时间）相同。
+
+不满足的条目标为**不可比**并给出原因，其余条目照常排名：
+
+| 情形 | 判定 | 不可比原因 |
+| --- | --- | --- |
+| 单条 `pg_stat_statements_reset(...)` 重置 | 条目保留但计数清零、`stats_since` 推进 | `stats_since_changed` |
+| 条目被淘汰（超过 `pg_stat_statements.max`）后重现 | 以新的 `stats_since` 重新累计 | `stats_since_changed`（若中间样本缺失则为 `only_in_*`） |
+| 只在新样本出现（新条目 / 重现） | 无旧基线可减 | `only_in_new_sample` |
+| 只在旧样本出现（被淘汰 / 全量重置后消失） | 无新值可减 | `only_in_previous_sample` |
+
+入榜条目输出调用数增量（`calls_delta`）、执行耗时增量
+（`exec_time_delta_ms`，毫秒）等，并**按执行耗时增量降序排名**。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/inspect/samples` | 手动采集一份样本。首次只建基线，之后每次与上一份有效样本配对生成榜单 |
+| GET | `/inspect/ranking` | 最近一次榜单；`?limit=N` 只看前 N 名 |
+| GET | `/inspect/samples` | 已保存样本列表与最近样本摘要 |
+| GET | `/inspect/samples/{sample_id}` | 某份样本的原始条目快照 |
+| POST | `/inspect/ranking/recompute` | 用任意两份已保存样本重算榜单（不改状态，会校验时间方向） |
+| POST | `/inspect/reset` | 重置单个条目（演示不可比场景），入参为条目四元组 |
+
+样本与榜单以 JSON 原子落盘到 `INSPECT_DATA_DIR`（容器内 `/data/inspect`，
+Compose 中挂载为命名卷 `inspect-data`，重启不丢）。
+
+### 并发与失败语义
+
+- **并发采样**：多个值班员同时点“采样”时，存储层用进程内 `asyncio` 锁 +
+  跨进程 `fcntl` 文件锁串行化，并在锁内完成“分配单调序号 → 采集 → 比对
+  基线 → 落盘”。基线防回退：新样本的 `(observed_at, 单调序号)` 必须严格
+  新于已保存基线，否则返回 `stale_observation` 拒绝，**较早的观测不会
+  覆盖较新的基线**。
+- **失败保留**：采集失败（数据库报错）或保存失败（磁盘错误）时不写任何
+  文件，接口返回 502，磁盘上的上次有效样本与榜单原样保留；故障恢复后
+  采样可继续，配对不受影响。
+
+### 在 /docs 里演示巡检
+
+1. 先造一些流量：连发若干次 `POST /query/normal` 和 `POST /query/slow`。
+2. `POST /inspect/samples` 两次（第一次建基线，第二次出榜单），
+   `GET /inspect/ranking` 即可看到 `pg_sleep` 一类慢 SQL 排在最前，
+   并带 `calls_delta` 与 `exec_time_delta_ms`。
+3. **单条重置**：从某份样本里复制目标条目的四元组，`POST /inspect/reset`
+   后再采样一次，该条目会以 `stats_since_changed` 出现在 `incomparable`
+   列表，其他条目照常排名。
+4. **并发采样**：同时发起多个 `POST /inspect/samples`，所有请求成功且
+   样本序号 / 观测时刻严格递增，无覆盖。
+
 ## 自测
 
 ```bash
@@ -66,7 +138,17 @@ pip install -r tests/requirements.txt
 # （连接数不超过上限、无残留活跃查询、无失败事务）
 export PSQL="postgresql://app:app@127.0.0.1:5432/demo"
 python tests/selftest.py
+
+# 巡检模块的单元测试 + 端到端测试（端到端需要可连接的 PG17）
+export PG_DSN="postgresql://app@127.0.0.1:5432/demo"
+python -m pytest tests/test_inspect.py -v
 ```
+
+巡检测试覆盖：榜单配对与排名规则、单条重置 / 淘汰重现 / 仅一次出现的
+不可比判定、stale 基线防回退、采集与保存失败时的状态保留、并发采样
+串行化（进程内与跨进程）、以及对真实 PostgreSQL 17 的端到端链路
+（含单条重置、10 路并发采样、全部 `/inspect` 路由的 HTTP 语义）。
+
 
 覆盖：普通查询、排队与并发上限、等连接超时、排队取消释放名额、
 查询超时后的连接清理/更换、两类 SQL 报错后的复用、客户端断开、
@@ -99,3 +181,18 @@ python tests/selftest.py
   总连接数 = 副本数 × `POOL_SIZE`，需要值班员按此规划。
 - 活性验证只在“借出时”进行；验证通过与实际执行之间的极短窗口内
   连接仍可能失效（此时该请求报错、连接被更换，属正常兜底路径）。
+
+### 巡检功能
+
+- 样本文件按次保存且不做自动清理，长期高频采样会持续占用
+  `INSPECT_DATA_DIR` 空间；当前需要运维定期归档/清理 `samples/` 目录
+  （`latest.json` 与 `ranking-latest.json` 不要手动删除）。
+- 防回退依赖服务端 `now()` 与存储层单调序号；若 PostgreSQL 时钟被
+  大幅回拨，对应采样会被标为 `stale_observation` 拒绝，需时钟恢复后
+  再采样（已有样本与榜单不受影响）。
+- 跨进程互斥依赖 `fcntl`（Linux/macOS 可用）；在不支持 `fcntl` 的
+  平台上退化为仅进程内锁，单 worker 部署仍然正确，多 worker 需借助
+  共享存储上的其他锁机制。
+- 巡检只读取/重置 `pg_stat_statements`，不做查询计划级分析；要定位
+  具体慢因仍需结合 `EXPLAIN` / `pg_stat_activity` 等手段。
+

@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from pool import AcquireTimeoutError, AsyncPool, PoolClosedError, PoolConfig
+from pg_inspect_api import router as inspect_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,9 +104,13 @@ app = FastAPI(
     description=(
         "多个应用共享有限的 PostgreSQL 连接。支持普通 / 延时 / 报错查询，"
         "可在 /pool/stats 查看连接池在用数、等待数等指标。"
+        "巡检员可在 /inspect 下手动采集 pg_stat_statements 样本并查看"
+        "相邻两次巡检之间的最耗时 SQL 榜单。"
     ),
     lifespan=lifespan,
 )
+
+app.include_router(inspect_router)
 
 
 @app.exception_handler(AcquireTimeoutError)

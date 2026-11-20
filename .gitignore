@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+# 本地手动运行时的巡检样本/榜单（容器内走命名卷 /data/inspect）
+/data/
+inspect-data/

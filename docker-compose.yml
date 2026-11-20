@@ -1,10 +1,21 @@
 services:
   db:
-    image: postgres:16-alpine
+    # PostgreSQL 17：pg_stat_statements 支持按条目的 stats_since（起算时间）
+    # 与单条重置 pg_stat_statements_reset(userid, dbid, queryid)，
+    # 是巡检榜单识别“单条重置 / 淘汰后重现”所必需的。
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
       POSTGRES_DB: demo
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.max=5000"
+      - "-c"
+      - "pg_stat_statements.track=all"
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
@@ -24,8 +35,16 @@ services:
       PGUSER: app
       PGPASSWORD: app
       POOL_SIZE: "4"
+      # 巡检样本与榜单的落盘目录（挂载到命名卷，容器重启后仍可配对）
+      INSPECT_DATA_DIR: /data/inspect
+      INSPECT_RANKING_LIMIT: "20"
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "8000:8000"
+    volumes:
+      - inspect-data:/data/inspect
+
+volumes:
+  inspect-data:
